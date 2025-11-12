@@ -1,37 +1,51 @@
-import { type User, type InsertUser } from "@shared/schema";
+import { type Whiteboard, type InsertWhiteboard } from "@shared/schema";
 import { randomUUID } from "crypto";
 
-// modify the interface with any CRUD methods
-// you might need
-
 export interface IStorage {
-  getUser(id: string): Promise<User | undefined>;
-  getUserByUsername(username: string): Promise<User | undefined>;
-  createUser(user: InsertUser): Promise<User>;
+  getAllWhiteboards(): Promise<Whiteboard[]>;
+  getWhiteboard(id: string): Promise<Whiteboard | undefined>;
+  createWhiteboard(whiteboard: InsertWhiteboard): Promise<Whiteboard>;
+  updateWhiteboard(id: string, whiteboard: Partial<InsertWhiteboard>): Promise<Whiteboard | undefined>;
+  deleteWhiteboard(id: string): Promise<boolean>;
 }
 
 export class MemStorage implements IStorage {
-  private users: Map<string, User>;
+  private whiteboards: Map<string, Whiteboard>;
 
   constructor() {
-    this.users = new Map();
+    this.whiteboards = new Map();
   }
 
-  async getUser(id: string): Promise<User | undefined> {
-    return this.users.get(id);
+  async getAllWhiteboards(): Promise<Whiteboard[]> {
+    return Array.from(this.whiteboards.values());
   }
 
-  async getUserByUsername(username: string): Promise<User | undefined> {
-    return Array.from(this.users.values()).find(
-      (user) => user.username === username,
-    );
+  async getWhiteboard(id: string): Promise<Whiteboard | undefined> {
+    return this.whiteboards.get(id);
   }
 
-  async createUser(insertUser: InsertUser): Promise<User> {
+  async createWhiteboard(insertWhiteboard: InsertWhiteboard): Promise<Whiteboard> {
     const id = randomUUID();
-    const user: User = { ...insertUser, id };
-    this.users.set(id, user);
-    return user;
+    const whiteboard: Whiteboard = { 
+      id, 
+      name: insertWhiteboard.name,
+      data: insertWhiteboard.data || []
+    };
+    this.whiteboards.set(id, whiteboard);
+    return whiteboard;
+  }
+
+  async updateWhiteboard(id: string, updates: Partial<InsertWhiteboard>): Promise<Whiteboard | undefined> {
+    const whiteboard = this.whiteboards.get(id);
+    if (!whiteboard) return undefined;
+    
+    const updated: Whiteboard = { ...whiteboard, ...updates };
+    this.whiteboards.set(id, updated);
+    return updated;
+  }
+
+  async deleteWhiteboard(id: string): Promise<boolean> {
+    return this.whiteboards.delete(id);
   }
 }
 

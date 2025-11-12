@@ -1,4 +1,5 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
+import { useQuery, useMutation } from "@tanstack/react-query";
 import { Plus, Menu } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -8,18 +9,17 @@ import { DrawingToolbar } from "@/components/DrawingToolbar";
 import { WhiteboardCard } from "@/components/WhiteboardCard";
 import { NewWhiteboardDialog } from "@/components/NewWhiteboardDialog";
 import { DeleteConfirmDialog } from "@/components/DeleteConfirmDialog";
+import { useToast } from "@/hooks/use-toast";
+import { queryClient, apiRequest } from "@/lib/queryClient";
+import type { Whiteboard } from "@shared/schema";
 
-interface Whiteboard {
-  id: string;
-  name: string;
+interface LocalWhiteboard extends Whiteboard {
   elements: DrawingElement[];
 }
 
 export default function WhiteboardPage() {
-  const [whiteboards, setWhiteboards] = useState<Whiteboard[]>([
-    { id: "1", name: "Welcome Board", elements: [] },
-  ]);
-  const [activeWhiteboardId, setActiveWhiteboardId] = useState("1");
+  const { toast } = useToast();
+  const [activeWhiteboardId, setActiveWhiteboardId] = useState<string | null>(null);
   const [tool, setTool] = useState<Tool>("pen");
   const [color, setColor] = useState("#000000");
   const [brushSize, setBrushSize] = useState(2);
@@ -34,80 +34,202 @@ export default function WhiteboardPage() {
     past: [],
     future: [],
   });
+  
+  const [localElements, setLocalElements] = useState<Record<string, DrawingElement[]>>({});
+  const saveTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
 
-  const activeWhiteboard = whiteboards.find((w) => w.id === activeWhiteboardId);
+  const { data: whiteboards = [], isLoading } = useQuery<Whiteboard[]>({
+    queryKey: ["/api/whiteboards"],
+  });
+
+  const localWhiteboards: LocalWhiteboard[] = whiteboards.map((wb) => ({
+    ...wb,
+    elements: localElements[wb.id] !== undefined 
+      ? localElements[wb.id]
+      : (Array.isArray(wb.data) ? wb.data : []) as DrawingElement[],
+  }));
+
+  const activeWhiteboard = localWhiteboards.find((w) => w.id === activeWhiteboardId);
+
+  useEffect(() => {
+    if (!activeWhiteboardId && localWhiteboards.length > 0) {
+      setActiveWhiteboardId(localWhiteboards[0].id);
+    }
+  }, [localWhiteboards, activeWhiteboardId]);
+
+  useEffect(() => {
+    whiteboards.forEach((wb) => {
+      if (localElements[wb.id] === undefined) {
+        setLocalElements((prev) => ({
+          ...prev,
+          [wb.id]: (Array.isArray(wb.data) ? wb.data : []) as DrawingElement[],
+        }));
+      }
+    });
+  }, [whiteboards]);
+
+  const createMutation = useMutation({
+    mutationFn: async (name: string) => {
+      const res = await apiRequest("POST", "/api/whiteboards", { name, data: [] });
+      return await res.json() as Whiteboard;
+    },
+    onSuccess: (newWhiteboard) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/whiteboards"] });
+      setActiveWhiteboardId(newWhiteboard.id);
+      setHistory({ past: [], future: [] });
+      setLocalElements((prev) => ({ ...prev, [newWhiteboard.id]: [] }));
+      toast({
+        title: "Whiteboard created",
+        description: `Created "${newWhiteboard.name}"`,
+      });
+    },
+    onError: () => {
+      toast({
+        title: "Error",
+        description: "Failed to create whiteboard",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const updateMutation = useMutation({
+    mutationFn: async ({ id, elements }: { id: string; elements: DrawingElement[] }) => {
+      const res = await apiRequest("PATCH", `/api/whiteboards/${id}`, { data: elements });
+      return await res.json() as Whiteboard;
+    },
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: async (id: string) => {
+      await apiRequest("DELETE", `/api/whiteboards/${id}`);
+    },
+    onSuccess: (_, deletedId) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/whiteboards"] });
+      setLocalElements((prev) => {
+        const newElements = { ...prev };
+        delete newElements[deletedId];
+        return newElements;
+      });
+      if (activeWhiteboardId === deletedId) {
+        const remaining = localWhiteboards.filter((w) => w.id !== deletedId);
+        setActiveWhiteboardId(remaining.length > 0 ? remaining[0].id : null);
+        setHistory({ past: [], future: [] });
+      }
+      toast({
+        title: "Whiteboard deleted",
+        description: "Whiteboard has been removed",
+      });
+    },
+    onError: () => {
+      toast({
+        title: "Error",
+        description: "Failed to delete whiteboard",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const saveToServer = useCallback((id: string, elements: DrawingElement[]) => {
+    if (saveTimeoutRef.current) {
+      clearTimeout(saveTimeoutRef.current);
+    }
+    saveTimeoutRef.current = setTimeout(() => {
+      updateMutation.mutate({ id, elements });
+    }, 500);
+  }, []);
 
   const updateActiveWhiteboard = useCallback((elements: DrawingElement[]) => {
-    setWhiteboards((prev) =>
-      prev.map((w) => (w.id === activeWhiteboardId ? { ...w, elements } : w))
-    );
+    if (!activeWhiteboardId) return;
+    
+    const currentElements = localElements[activeWhiteboardId] || [];
+    
     setHistory((prev) => ({
-      past: [...prev.past, activeWhiteboard?.elements || []],
+      past: [...prev.past, [...currentElements]],
       future: [],
     }));
-  }, [activeWhiteboardId, activeWhiteboard]);
+
+    setLocalElements((prev) => ({
+      ...prev,
+      [activeWhiteboardId]: elements,
+    }));
+
+    saveToServer(activeWhiteboardId, elements);
+  }, [activeWhiteboardId, localElements, saveToServer]);
 
   const handleUndo = () => {
-    if (history.past.length === 0) return;
+    if (history.past.length === 0 || !activeWhiteboardId) return;
     const previous = history.past[history.past.length - 1];
     const newPast = history.past.slice(0, -1);
+    const currentElements = localElements[activeWhiteboardId] || [];
+    
     setHistory({
       past: newPast,
-      future: [activeWhiteboard?.elements || [], ...history.future],
+      future: [[...currentElements], ...history.future],
     });
-    setWhiteboards((prev) =>
-      prev.map((w) => (w.id === activeWhiteboardId ? { ...w, elements: previous } : w))
-    );
+    
+    setLocalElements((prev) => ({
+      ...prev,
+      [activeWhiteboardId]: previous,
+    }));
+
+    saveToServer(activeWhiteboardId, previous);
   };
 
   const handleRedo = () => {
-    if (history.future.length === 0) return;
+    if (history.future.length === 0 || !activeWhiteboardId) return;
     const next = history.future[0];
     const newFuture = history.future.slice(1);
+    const currentElements = localElements[activeWhiteboardId] || [];
+    
     setHistory({
-      past: [...history.past, activeWhiteboard?.elements || []],
+      past: [...history.past, [...currentElements]],
       future: newFuture,
     });
-    setWhiteboards((prev) =>
-      prev.map((w) => (w.id === activeWhiteboardId ? { ...w, elements: next } : w))
-    );
+    
+    setLocalElements((prev) => ({
+      ...prev,
+      [activeWhiteboardId]: next,
+    }));
+
+    saveToServer(activeWhiteboardId, next);
   };
 
   const handleClear = () => {
-    if (activeWhiteboard) {
-      setHistory({
-        past: [...history.past, activeWhiteboard.elements],
-        future: [],
-      });
-      updateActiveWhiteboard([]);
-    }
+    if (!activeWhiteboardId) return;
+    const currentElements = localElements[activeWhiteboardId] || [];
+    
+    setHistory({
+      past: [...history.past, [...currentElements]],
+      future: [],
+    });
+    
+    setLocalElements((prev) => ({
+      ...prev,
+      [activeWhiteboardId]: [],
+    }));
+
+    saveToServer(activeWhiteboardId, []);
   };
 
   const handleCreateWhiteboard = (name: string) => {
-    const newWhiteboard: Whiteboard = {
-      id: Date.now().toString(),
-      name,
-      elements: [],
-    };
-    setWhiteboards((prev) => [...prev, newWhiteboard]);
-    setActiveWhiteboardId(newWhiteboard.id);
-    setHistory({ past: [], future: [] });
+    createMutation.mutate(name);
   };
 
   const handleDeleteWhiteboard = (id: string) => {
-    setWhiteboards((prev) => {
-      const filtered = prev.filter((w) => w.id !== id);
-      if (activeWhiteboardId === id && filtered.length > 0) {
-        setActiveWhiteboardId(filtered[0].id);
-        setHistory({ past: [], future: [] });
-      }
-      return filtered;
-    });
+    deleteMutation.mutate(id);
   };
 
   const openDeleteDialog = (id: string, name: string) => {
     setDeleteDialog({ open: true, id, name });
   };
+
+  if (isLoading) {
+    return (
+      <div className="h-screen flex items-center justify-center">
+        <p className="text-muted-foreground">Loading whiteboards...</p>
+      </div>
+    );
+  }
 
   return (
     <div className="h-screen flex">
@@ -133,19 +255,26 @@ export default function WhiteboardPage() {
           </div>
           <ScrollArea className="flex-1">
             <div className="p-4 space-y-3">
-              {whiteboards.map((whiteboard) => (
-                <WhiteboardCard
-                  key={whiteboard.id}
-                  id={whiteboard.id}
-                  name={whiteboard.name}
-                  onClick={() => {
-                    setActiveWhiteboardId(whiteboard.id);
-                    setHistory({ past: [], future: [] });
-                  }}
-                  onDelete={() => openDeleteDialog(whiteboard.id, whiteboard.name)}
-                  isActive={whiteboard.id === activeWhiteboardId}
-                />
-              ))}
+              {localWhiteboards.length === 0 ? (
+                <div className="text-center py-8">
+                  <p className="text-sm text-muted-foreground">No whiteboards yet</p>
+                  <p className="text-xs text-muted-foreground mt-1">Create one to get started</p>
+                </div>
+              ) : (
+                localWhiteboards.map((whiteboard) => (
+                  <WhiteboardCard
+                    key={whiteboard.id}
+                    id={whiteboard.id}
+                    name={whiteboard.name}
+                    onClick={() => {
+                      setActiveWhiteboardId(whiteboard.id);
+                      setHistory({ past: [], future: [] });
+                    }}
+                    onDelete={() => openDeleteDialog(whiteboard.id, whiteboard.name)}
+                    isActive={whiteboard.id === activeWhiteboardId}
+                  />
+                ))
+              )}
             </div>
           </ScrollArea>
         </div>
